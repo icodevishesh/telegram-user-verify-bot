@@ -1,0 +1,23 @@
+{
+  "name": "telegram-verify-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot to verify user IDs against XM / Xilion broker sheets",
+  "main": "dist/bot.js",
+  "scripts": {
+    "dev": "ts-node bot.ts",
+    "build": "tsc",
+    "start": "node dist/bot.js",
+    "start:prod": "npm run build && npm start"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "node-telegram-bot-api": "^0.66.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "@types/node-telegram-bot-api": "^0.64.7",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
