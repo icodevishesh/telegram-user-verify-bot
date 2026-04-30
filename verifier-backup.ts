@@ -33,11 +33,13 @@ function readXilionSheet(filePath: string): Record<string, string>[] {
   const ws = wb.Sheets[wb.SheetNames[0]];
   const raw = XLSX.utils.sheet_to_json<string[]>(ws, { header: 1, defval: "" });
 
+  // Find the actual header row (first row whose first cell is "Wallet")
   const headerRowIdx = raw.findIndex(
     (row) => String(row[0]).trim().toLowerCase() === "wallet"
   );
 
   if (headerRowIdx === -1) {
+    // Fallback: treat row 1 as header (skip row 0 sep= line)
     const headers = raw[1] as string[];
     return (raw.slice(2) as string[][]).map((row) => {
       const obj: Record<string, string> = {};
@@ -56,6 +58,7 @@ function readXilionSheet(filePath: string): Record<string, string>[] {
 
 // ── ID normalisation ──────────────────────────────────────────────────────────
 
+/** Trim, strip leading #, lowercase */
 function norm(val: unknown): string {
   if (val === null || val === undefined) return "";
   return String(val).trim().replace(/^#/, "").toLowerCase();
@@ -113,18 +116,6 @@ export interface DuplicateResult {
   both: number;
 }
 
-export interface OldOnlyOptions {
-  oldPath: string;
-  newPath: string;
-}
-
-export interface OldOnlyResult {
-  outputPath: string;
-  oldCount: number;
-  newCount: number;
-  oldOnlyCount: number;
-}
-
 // ── Normalize values for comparison ───────────────────────────────────────────
 function normalizeForCompare(val: unknown): string {
   if (val === null || val === undefined) return "";
@@ -158,94 +149,19 @@ function getPhone(row: Record<string, string>): string {
   );
 }
 
-// ── Shared: build email+phone sets from New rows ──────────────────────────────
-function buildNewMatchSets(newRows: Record<string, string>[]): {
-  newByEmail: Set<string>;
-  newByPhone: Set<string>;
-} {
-  const newByEmail = new Set<string>();
-  const newByPhone = new Set<string>();
-  for (const row of newRows) {
-    const email = getEmail(row);
-    const phone = getPhone(row);
-    if (email) newByEmail.add(email);
-    if (phone) newByPhone.add(phone);
-  }
-  return { newByEmail, newByPhone };
-}
-
-// ── Old Only export ───────────────────────────────────────────────────────────
-// Returns only rows from Old that have NO match (by email OR phone) in New.
-// Output sheet contains all original Old fields — no extra columns added.
-
-export async function processOldOnly(opts: OldOnlyOptions): Promise<OldOnlyResult> {
-  const { oldPath, newPath } = opts;
-
-  const oldRows = readStandardSheet(oldPath);
-  const newRows = readStandardSheet(newPath);
-
-  if (oldRows.length === 0) throw new Error("old.csv appears to be empty or has no data rows.");
-  if (newRows.length === 0) throw new Error("new.csv appears to be empty or has no data rows.");
-
-  // Build lookup sets from New
-  const { newByEmail, newByPhone } = buildNewMatchSets(newRows);
-
-  // Keep only Old rows that have NO match in New
-  const oldOnlyRows: Record<string, string>[] = [];
-
-  for (const row of oldRows) {
-    const email = getEmail(row);
-    const phone = getPhone(row);
-
-    const isInNew =
-      (email && newByEmail.has(email)) ||
-      (phone && newByPhone.has(phone));
-
-    if (!isInNew) {
-      oldOnlyRows.push({ ...row });
-    }
-  }
-
-  // Write output XLSX
-  const outputDir = path.join(__dirname, "outputs");
-  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-
-  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const outputPath = path.join(outputDir, `old_only_${ts}.xlsx`);
-
-  const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.json_to_sheet(oldOnlyRows);
-
-  // Auto-size columns
-  if (oldOnlyRows.length > 0) {
-    const keys = Object.keys(oldOnlyRows[0]);
-    ws["!cols"] = keys.map((k) => ({
-      wch: Math.max(k.length, ...oldOnlyRows.map((r) => String(r[k] ?? "").length)),
-    }));
-  }
-
-  XLSX.utils.book_append_sheet(wb, ws, "Old Only");
-  XLSX.writeFile(wb, outputPath);
-
-  return {
-    outputPath,
-    oldCount: oldRows.length,
-    newCount: newRows.length,
-    oldOnlyCount: oldOnlyRows.length,
-  };
-}
-
 // ── Duplicate detection export ────────────────────────────────────────────────
 export async function processDuplicates(opts: DuplicateOptions): Promise<DuplicateResult> {
   const { oldPath, newPath } = opts;
 
+  // Read both sheets
   const oldRows = readStandardSheet(oldPath);
   const newRows = readStandardSheet(newPath);
 
   if (oldRows.length === 0) throw new Error("old.csv appears to be empty or has no data rows.");
   if (newRows.length === 0) throw new Error("new.csv appears to be empty or has no data rows.");
 
-  // Build lookup maps from Old rows (by email and phone separately)
+  // ── Build lookup maps from Old rows (by email and phone separately) ──────
+  // Using OR logic: a person is a duplicate if email OR phone matches.
   const oldByEmail = new Map<string, Record<string, string>>();
   const oldByPhone = new Map<string, Record<string, string>>();
 
@@ -256,10 +172,12 @@ export async function processDuplicates(opts: DuplicateOptions): Promise<Duplica
     if (phone) oldByPhone.set(phone, row);
   }
 
+  // ── Process New rows ──────────────────────────────────────────────────────
   let oldOnlyCount = 0;
   let newOnlyCount = 0;
   let bothCount = 0;
 
+  // Track which old emails/phones were matched (to find Old-only rows later)
   const matchedOldEmails = new Set<string>();
   const matchedOldPhones = new Set<string>();
 
@@ -295,7 +213,7 @@ export async function processDuplicates(opts: DuplicateOptions): Promise<Duplica
     });
   }
 
-  // Add Old-only rows
+  // ── Add Old-only rows (those not matched by any New row) ──────────────────
   for (const row of oldRows) {
     const email = getEmail(row);
     const phone = getPhone(row);
@@ -316,7 +234,7 @@ export async function processDuplicates(opts: DuplicateOptions): Promise<Duplica
     }
   }
 
-  // Sort: Old Only → New Only → Both
+  // ── Sort: Old Only → New Only → Both ─────────────────────────────────────
   outputRows.sort((a, b) => {
     const order: Record<string, number> = {
       "Present in Old Only": 0,
@@ -326,7 +244,7 @@ export async function processDuplicates(opts: DuplicateOptions): Promise<Duplica
     return (order[a["Presence"]] ?? 0) - (order[b["Presence"]] ?? 0);
   });
 
-  // Write output XLSX
+  // ── Write output XLSX ─────────────────────────────────────────────────────
   const outputDir = path.join(__dirname, "outputs");
   if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
@@ -336,6 +254,7 @@ export async function processDuplicates(opts: DuplicateOptions): Promise<Duplica
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.json_to_sheet(outputRows);
 
+  // Auto-size columns
   const keys = Object.keys(outputRows[0] ?? {});
   ws["!cols"] = keys.map((k) => ({
     wch: Math.max(k.length, ...outputRows.map((r) => String(r[k] ?? "").length)),
@@ -359,6 +278,7 @@ export async function processDuplicates(opts: DuplicateOptions): Promise<Duplica
 export async function processVerification(opts: VerifyOptions): Promise<VerifyResult> {
   const { xmPath, xilionPath, mtfPath } = opts;
 
+  // 1. Read all 3 sheets
   const xmRows     = readStandardSheet(xmPath);
   const xilionRows = readXilionSheet(xilionPath);
   const mtfRows    = readStandardSheet(mtfPath);
@@ -367,12 +287,14 @@ export async function processVerification(opts: VerifyOptions): Promise<VerifyRe
   if (xilionRows.length === 0) throw new Error("xilion.csv appears to be empty or has no data rows.");
   if (mtfRows.length === 0)    throw new Error("mtf.csv appears to be empty or has no data rows.");
 
+  // 2. Build combined broker ID lookup (XM + Xilion merged)
   const xmIds     = buildXmIds(xmRows);
   const xilionIds = buildXilionIds(xilionRows);
 
   if (xmIds.size === 0)     throw new Error("No IDs found in xm.csv — expected 'MT4/MT5 ID' and 'Client ID' columns.");
   if (xilionIds.size === 0) throw new Error("No IDs found in xilion.csv — expected a 'Wallet' column.");
 
+  // 3. Tag each MTF record
   let verified = 0;
   let notVerified = 0;
 
@@ -386,6 +308,7 @@ export async function processVerification(opts: VerifyOptions): Promise<VerifyRe
     return { ...row, Verified: isVerified ? "Yes" : "No" };
   });
 
+  // 4. Write output XLSX
   const outputDir = path.join(__dirname, "outputs");
   if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
 
@@ -395,6 +318,7 @@ export async function processVerification(opts: VerifyOptions): Promise<VerifyRe
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.json_to_sheet(outputRows);
 
+  // Auto-size columns
   const keys = Object.keys(outputRows[0] ?? {});
   ws["!cols"] = keys.map((k) => ({
     wch: Math.max(k.length, ...outputRows.map((r) => String(r[k as keyof typeof r] ?? "").length)),

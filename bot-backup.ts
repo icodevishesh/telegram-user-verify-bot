@@ -2,7 +2,7 @@ import "dotenv/config";
 import TelegramBot from "node-telegram-bot-api";
 import * as fs from "fs";
 import * as path from "path";
-import { processVerification, processDuplicates, processOldOnly } from "./verifier";
+import { processVerification, processDuplicates } from "./verifier";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
 if (!TOKEN) {
@@ -18,7 +18,7 @@ interface UploadedFile {
   savedPath: string;
 }
 
-type SessionType = "verify" | "duplicates" | "oldonly";
+type SessionType = "verify" | "duplicates";
 
 interface Session {
   type: SessionType;
@@ -27,7 +27,7 @@ interface Session {
   mtf?: UploadedFile;
   old?: UploadedFile;
   new?: UploadedFile;
-  processing: boolean;
+  processing: boolean;   // ← lock: prevents duplicate verification runs
 }
 
 const sessions: Record<number, Session> = {};
@@ -100,7 +100,6 @@ bot.onText(/\/start/, (msg) => {
     `*Commands:*\n` +
     `/verify — Start a new verification session\n` +
     `/duplicates — Compare old & new CSV sheets for duplicates\n` +
-    `/oldonly — Extract records present in Old but not in New\n` +
     `/status — Check which files have been uploaded\n` +
     `/reset  — Clear the current session\n` +
     `/help   — Show usage instructions`,
@@ -126,50 +125,46 @@ bot.onText(/\/help/, (msg) => {
     `   • \`old.csv\` — Old records\n` +
     `   • \`new.csv\` — New records\n` +
     `3️⃣ Processing starts automatically\n` +
-    `4️⃣ Bot sends back an XLSX with full comparison\n\n` +
-    `*Old Only (New Leads):*\n` +
-    `1️⃣ Send /oldonly to start\n` +
-    `2️⃣ Upload *2 files* (in any order):\n` +
-    `   • \`old.csv\` — Old records\n` +
-    `   • \`new.csv\` — New records\n` +
-    `3️⃣ Processing starts automatically\n` +
-    `4️⃣ Bot sends back an XLSX with *only* records from Old that are NOT in New\n\n` +
+    `4️⃣ Bot sends back an XLSX with a *Duplicate* column\n\n` +
     `⚠️ Files must be named *exactly* as shown above\n\n` +
     `*Matching logic:*\n` +
     `• XM → \`MT4/MT5 ID\` and \`Client ID\` columns\n` +
     `• Xilion → \`Wallet\` column (e.g. #316393)\n` +
-    `• Duplicates / Old Only → Matches on \`Email\` OR \`Phone\` (either field is enough)`,
+    `• Duplicates → Matches on \`Name\`, \`Email Id\`, \`Contact Number\``,
     { parse_mode: "Markdown" }
   );
 });
 
 bot.onText(/\/reset/, (msg) => {
   cleanupSession(msg.chat.id);
-  bot.sendMessage(msg.chat.id, "🔄 Session cleared. Send /verify, /duplicates, or /oldonly to start again.");
+  bot.sendMessage(msg.chat.id, "🔄 Session cleared. Send /verify to start again.");
 });
 
 bot.onText(/\/status/, (msg) => {
   const chatId = msg.chat.id;
   const s = sessions[chatId];
   if (!s) {
-    bot.sendMessage(chatId, "No active session. Send /verify, /duplicates, or /oldonly to begin.");
+    bot.sendMessage(chatId, "No active session. Send /verify or /duplicates to begin.");
     return;
   }
 
   if (s.type === "verify") {
     const extra = s.processing
       ? `⚙️ Verification is currently running…`
-      : isVerifyComplete(s) ? `✅ All files received.` : `Upload the remaining files to continue.`;
+      : isVerifyComplete(s)
+      ? `✅ All files received.`
+      : `Upload the remaining files to continue.`;
     bot.sendMessage(
       chatId,
       `*Upload Status:*\n\n${verifySessionSummary(s)}\n\n${extra}`,
       { parse_mode: "Markdown" }
     );
   } else {
-    // duplicates or oldonly — both use old + new
     const extra = s.processing
-      ? `⚙️ Processing is currently running…`
-      : isDuplicateComplete(s) ? `✅ All files received.` : `Upload the remaining files to continue.`;
+      ? `⚙️ Duplicate check is currently running…`
+      : isDuplicateComplete(s)
+      ? `✅ All files received.`
+      : `Upload the remaining files to continue.`;
     bot.sendMessage(
       chatId,
       `*Upload Status:*\n\n${duplicateSessionSummary(s)}\n\n${extra}`,
@@ -205,24 +200,7 @@ bot.onText(/\/duplicates/, (msg) => {
     `⬜ \`old.csv\` — Old records\n` +
     `⬜ \`new.csv\` — New records\n\n` +
     `⚠️ Files must be named exactly as shown above.\n\n` +
-    `📋 Matches on: *Email* OR *Phone* (either field is enough)`,
-    { parse_mode: "Markdown" }
-  );
-});
-
-bot.onText(/\/oldonly/, (msg) => {
-  const chatId = msg.chat.id;
-  cleanupSession(chatId);
-  sessions[chatId] = { type: "oldonly", processing: false };
-  bot.sendMessage(
-    chatId,
-    `✅ *Old Only session started!*\n\n` +
-    `This will extract records from *old.csv* that are *NOT* present in *new.csv*.\n\n` +
-    `Upload these *2 files* in any order:\n\n` +
-    `⬜ \`old.csv\` — Old records\n` +
-    `⬜ \`new.csv\` — New records\n\n` +
-    `⚠️ Files must be named exactly as shown above.\n\n` +
-    `📋 Matches on: *Email* OR *Phone* (either field is enough)`,
+    `📋 Columns checked: *Name*, *Email Id*, *Contact Number*`,
     { parse_mode: "Markdown" }
   );
 });
@@ -233,16 +211,18 @@ bot.on("document", async (msg) => {
 
   const s = sessions[chatId];
   if (!s) {
-    bot.sendMessage(chatId, "⚠️ No active session. Send /verify, /duplicates, or /oldonly first.");
+    bot.sendMessage(chatId, "⚠️ No active session. Send /verify or /duplicates first.");
     return;
   }
 
+  // If already processing, ignore any stray events
   if (s.processing) return;
 
   const doc = msg.document!;
   const fileName = (doc.file_name || "").trim();
   const ext = path.extname(fileName).toLowerCase();
 
+  // ── Validate extension ────────────────────────────────────────────────────
   if (![".csv", ".xlsx", ".xls"].includes(ext)) {
     bot.sendMessage(chatId,
       `❌ *${fileName}* — only CSV or XLSX files are accepted.`,
@@ -251,14 +231,16 @@ bot.on("document", async (msg) => {
     return;
   }
 
-  // ── Validate filename based on session type ───────────────────────────────
+  // ── Validate filename based on session type ────────────────────────────────
   let slot: string | null = null;
+  let acceptedNames: readonly string[] = [];
 
   if (s.type === "verify") {
     slot = resolveVerifySlot(fileName);
+    acceptedNames = VERIFY_NAMES;
   } else {
-    // duplicates and oldonly both use old + new
     slot = resolveDuplicateSlot(fileName);
+    acceptedNames = DUPLICATE_NAMES;
   }
 
   if (!slot) {
@@ -312,33 +294,28 @@ bot.on("document", async (msg) => {
         { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
       );
 
+      // ── All 3 ready → lock and run (only once) ────────────────────────────
       if (isVerifyComplete(s) && !s.processing) {
         s.processing = true;
         await runVerification(chatId, s);
       }
-
     } else {
-      // duplicates or oldonly
       const remaining = DUPLICATE_NAMES.filter((k) => !s[k as keyof Session]);
       const remainingList = remaining.map((r) => `\`${r}.csv\``).join(" · ");
-      const actionLabel = s.type === "oldonly" ? "old only extraction" : "duplicate check";
 
       await bot.editMessageText(
         `✅ *${fileName}* received!\n\n` +
         `*Progress:*\n${duplicateSessionSummary(s)}\n\n` +
         (remaining.length > 0
           ? `Still needed: ${remainingList}`
-          : `🚀 All files received! Starting ${actionLabel}…`),
+          : `🚀 All files received! Starting duplicate check…`),
         { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
       );
 
+      // ── All 2 ready → lock and run (only once) ────────────────────────────
       if (isDuplicateComplete(s) && !s.processing) {
         s.processing = true;
-        if (s.type === "oldonly") {
-          await runOldOnly(chatId, s);
-        } else {
-          await runDuplicates(chatId, s);
-        }
+        await runDuplicates(chatId, s);
       }
     }
 
@@ -377,7 +354,7 @@ async function runVerification(chatId: number, s: Session) {
     cleanupSession(chatId);
 
   } catch (err: any) {
-    s.processing = false;
+    s.processing = false;   // release lock on error so user can /reset and retry
     bot.sendMessage(
       chatId,
       `❌ *Verification failed:* ${err.message}\n\nCheck your files and use /reset to try again.`,
@@ -397,10 +374,11 @@ async function runDuplicates(chatId: number, s: Session) {
     await bot.sendMessage(
       chatId,
       `✅ *Comparison Complete!*\n\n` +
+      `*Total Records:*\n` +
       `📊 Old records: *${result.oldCount}*\n` +
       `📊 New records: *${result.newCount}*\n\n` +
       `*Results:*\n` +
-      `🔶 Old Only: *${result.oldOnly}*\n` +
+      `� Old Only: *${result.oldOnly}*\n` +
       `🟢 New Only: *${result.newOnly}*\n` +
       `🔵 Both (Duplicates): *${result.both}*\n\n` +
       `Sending your output file…`,
@@ -415,45 +393,10 @@ async function runDuplicates(chatId: number, s: Session) {
     cleanupSession(chatId);
 
   } catch (err: any) {
-    s.processing = false;
+    s.processing = false;   // release lock on error so user can /reset and retry
     bot.sendMessage(
       chatId,
       `❌ *Comparison failed:* ${err.message}\n\nCheck your files and use /reset to try again.`,
-      { parse_mode: "Markdown" }
-    );
-  }
-}
-
-// ── Old Only runner ───────────────────────────────────────────────────────────
-async function runOldOnly(chatId: number, s: Session) {
-  try {
-    const result = await processOldOnly({
-      oldPath: s.old!.savedPath,
-      newPath: s.new!.savedPath,
-    });
-
-    await bot.sendMessage(
-      chatId,
-      `✅ *Old Only Extraction Complete!*\n\n` +
-      `📊 Old records: *${result.oldCount}*\n` +
-      `📊 New records: *${result.newCount}*\n\n` +
-      `🔶 Records in Old but NOT in New: *${result.oldOnlyCount}*\n\n` +
-      `Sending your output file…`,
-      { parse_mode: "Markdown" }
-    );
-
-    await bot.sendDocument(chatId, result.outputPath, {
-      caption: `Old Only output — ${new Date().toLocaleDateString("en-IN")}`,
-    });
-
-    try { fs.unlinkSync(result.outputPath); } catch {}
-    cleanupSession(chatId);
-
-  } catch (err: any) {
-    s.processing = false;
-    bot.sendMessage(
-      chatId,
-      `❌ *Old Only extraction failed:* ${err.message}\n\nCheck your files and use /reset to try again.`,
       { parse_mode: "Markdown" }
     );
   }

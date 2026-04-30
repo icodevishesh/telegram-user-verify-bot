@@ -109,7 +109,6 @@ bot.onText(/\/start/, (msg) => {
         `*Commands:*\n` +
         `/verify — Start a new verification session\n` +
         `/duplicates — Compare old & new CSV sheets for duplicates\n` +
-        `/oldonly — Extract records present in Old but not in New\n` +
         `/status — Check which files have been uploaded\n` +
         `/reset  — Clear the current session\n` +
         `/help   — Show usage instructions`, { parse_mode: "Markdown" });
@@ -130,42 +129,38 @@ bot.onText(/\/help/, (msg) => {
         `   • \`old.csv\` — Old records\n` +
         `   • \`new.csv\` — New records\n` +
         `3️⃣ Processing starts automatically\n` +
-        `4️⃣ Bot sends back an XLSX with full comparison\n\n` +
-        `*Old Only (New Leads):*\n` +
-        `1️⃣ Send /oldonly to start\n` +
-        `2️⃣ Upload *2 files* (in any order):\n` +
-        `   • \`old.csv\` — Old records\n` +
-        `   • \`new.csv\` — New records\n` +
-        `3️⃣ Processing starts automatically\n` +
-        `4️⃣ Bot sends back an XLSX with *only* records from Old that are NOT in New\n\n` +
+        `4️⃣ Bot sends back an XLSX with a *Duplicate* column\n\n` +
         `⚠️ Files must be named *exactly* as shown above\n\n` +
         `*Matching logic:*\n` +
         `• XM → \`MT4/MT5 ID\` and \`Client ID\` columns\n` +
         `• Xilion → \`Wallet\` column (e.g. #316393)\n` +
-        `• Duplicates / Old Only → Matches on \`Email\` OR \`Phone\` (either field is enough)`, { parse_mode: "Markdown" });
+        `• Duplicates → Matches on \`Name\`, \`Email Id\`, \`Contact Number\``, { parse_mode: "Markdown" });
 });
 bot.onText(/\/reset/, (msg) => {
     cleanupSession(msg.chat.id);
-    bot.sendMessage(msg.chat.id, "🔄 Session cleared. Send /verify, /duplicates, or /oldonly to start again.");
+    bot.sendMessage(msg.chat.id, "🔄 Session cleared. Send /verify to start again.");
 });
 bot.onText(/\/status/, (msg) => {
     const chatId = msg.chat.id;
     const s = sessions[chatId];
     if (!s) {
-        bot.sendMessage(chatId, "No active session. Send /verify, /duplicates, or /oldonly to begin.");
+        bot.sendMessage(chatId, "No active session. Send /verify or /duplicates to begin.");
         return;
     }
     if (s.type === "verify") {
         const extra = s.processing
             ? `⚙️ Verification is currently running…`
-            : isVerifyComplete(s) ? `✅ All files received.` : `Upload the remaining files to continue.`;
+            : isVerifyComplete(s)
+                ? `✅ All files received.`
+                : `Upload the remaining files to continue.`;
         bot.sendMessage(chatId, `*Upload Status:*\n\n${verifySessionSummary(s)}\n\n${extra}`, { parse_mode: "Markdown" });
     }
     else {
-        // duplicates or oldonly — both use old + new
         const extra = s.processing
-            ? `⚙️ Processing is currently running…`
-            : isDuplicateComplete(s) ? `✅ All files received.` : `Upload the remaining files to continue.`;
+            ? `⚙️ Duplicate check is currently running…`
+            : isDuplicateComplete(s)
+                ? `✅ All files received.`
+                : `Upload the remaining files to continue.`;
         bot.sendMessage(chatId, `*Upload Status:*\n\n${duplicateSessionSummary(s)}\n\n${extra}`, { parse_mode: "Markdown" });
     }
 });
@@ -189,45 +184,37 @@ bot.onText(/\/duplicates/, (msg) => {
         `⬜ \`old.csv\` — Old records\n` +
         `⬜ \`new.csv\` — New records\n\n` +
         `⚠️ Files must be named exactly as shown above.\n\n` +
-        `📋 Matches on: *Email* OR *Phone* (either field is enough)`, { parse_mode: "Markdown" });
-});
-bot.onText(/\/oldonly/, (msg) => {
-    const chatId = msg.chat.id;
-    cleanupSession(chatId);
-    sessions[chatId] = { type: "oldonly", processing: false };
-    bot.sendMessage(chatId, `✅ *Old Only session started!*\n\n` +
-        `This will extract records from *old.csv* that are *NOT* present in *new.csv*.\n\n` +
-        `Upload these *2 files* in any order:\n\n` +
-        `⬜ \`old.csv\` — Old records\n` +
-        `⬜ \`new.csv\` — New records\n\n` +
-        `⚠️ Files must be named exactly as shown above.\n\n` +
-        `📋 Matches on: *Email* OR *Phone* (either field is enough)`, { parse_mode: "Markdown" });
+        `📋 Columns checked: *Name*, *Email Id*, *Contact Number*`, { parse_mode: "Markdown" });
 });
 // ── Document handler ──────────────────────────────────────────────────────────
 bot.on("document", async (msg) => {
     const chatId = msg.chat.id;
     const s = sessions[chatId];
     if (!s) {
-        bot.sendMessage(chatId, "⚠️ No active session. Send /verify, /duplicates, or /oldonly first.");
+        bot.sendMessage(chatId, "⚠️ No active session. Send /verify or /duplicates first.");
         return;
     }
+    // If already processing, ignore any stray events
     if (s.processing)
         return;
     const doc = msg.document;
     const fileName = (doc.file_name || "").trim();
     const ext = path.extname(fileName).toLowerCase();
+    // ── Validate extension ────────────────────────────────────────────────────
     if (![".csv", ".xlsx", ".xls"].includes(ext)) {
         bot.sendMessage(chatId, `❌ *${fileName}* — only CSV or XLSX files are accepted.`, { parse_mode: "Markdown" });
         return;
     }
-    // ── Validate filename based on session type ───────────────────────────────
+    // ── Validate filename based on session type ────────────────────────────────
     let slot = null;
+    let acceptedNames = [];
     if (s.type === "verify") {
         slot = resolveVerifySlot(fileName);
+        acceptedNames = VERIFY_NAMES;
     }
     else {
-        // duplicates and oldonly both use old + new
         slot = resolveDuplicateSlot(fileName);
+        acceptedNames = DUPLICATE_NAMES;
     }
     if (!slot) {
         const expectedFiles = s.type === "verify"
@@ -262,29 +249,24 @@ bot.on("document", async (msg) => {
                 (remaining.length > 0
                     ? `Still needed: ${remainingList}`
                     : `🚀 All files received! Starting verification…`), { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" });
+            // ── All 3 ready → lock and run (only once) ────────────────────────────
             if (isVerifyComplete(s) && !s.processing) {
                 s.processing = true;
                 await runVerification(chatId, s);
             }
         }
         else {
-            // duplicates or oldonly
             const remaining = DUPLICATE_NAMES.filter((k) => !s[k]);
             const remainingList = remaining.map((r) => `\`${r}.csv\``).join(" · ");
-            const actionLabel = s.type === "oldonly" ? "old only extraction" : "duplicate check";
             await bot.editMessageText(`✅ *${fileName}* received!\n\n` +
                 `*Progress:*\n${duplicateSessionSummary(s)}\n\n` +
                 (remaining.length > 0
                     ? `Still needed: ${remainingList}`
-                    : `🚀 All files received! Starting ${actionLabel}…`), { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" });
+                    : `🚀 All files received! Starting duplicate check…`), { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" });
+            // ── All 2 ready → lock and run (only once) ────────────────────────────
             if (isDuplicateComplete(s) && !s.processing) {
                 s.processing = true;
-                if (s.type === "oldonly") {
-                    await runOldOnly(chatId, s);
-                }
-                else {
-                    await runDuplicates(chatId, s);
-                }
+                await runDuplicates(chatId, s);
             }
         }
     }
@@ -315,7 +297,7 @@ async function runVerification(chatId, s) {
         cleanupSession(chatId);
     }
     catch (err) {
-        s.processing = false;
+        s.processing = false; // release lock on error so user can /reset and retry
         bot.sendMessage(chatId, `❌ *Verification failed:* ${err.message}\n\nCheck your files and use /reset to try again.`, { parse_mode: "Markdown" });
     }
 }
@@ -327,10 +309,11 @@ async function runDuplicates(chatId, s) {
             newPath: s.new.savedPath,
         });
         await bot.sendMessage(chatId, `✅ *Comparison Complete!*\n\n` +
+            `*Total Records:*\n` +
             `📊 Old records: *${result.oldCount}*\n` +
             `📊 New records: *${result.newCount}*\n\n` +
             `*Results:*\n` +
-            `🔶 Old Only: *${result.oldOnly}*\n` +
+            `� Old Only: *${result.oldOnly}*\n` +
             `🟢 New Only: *${result.newOnly}*\n` +
             `🔵 Both (Duplicates): *${result.both}*\n\n` +
             `Sending your output file…`, { parse_mode: "Markdown" });
@@ -344,34 +327,8 @@ async function runDuplicates(chatId, s) {
         cleanupSession(chatId);
     }
     catch (err) {
-        s.processing = false;
+        s.processing = false; // release lock on error so user can /reset and retry
         bot.sendMessage(chatId, `❌ *Comparison failed:* ${err.message}\n\nCheck your files and use /reset to try again.`, { parse_mode: "Markdown" });
-    }
-}
-// ── Old Only runner ───────────────────────────────────────────────────────────
-async function runOldOnly(chatId, s) {
-    try {
-        const result = await (0, verifier_1.processOldOnly)({
-            oldPath: s.old.savedPath,
-            newPath: s.new.savedPath,
-        });
-        await bot.sendMessage(chatId, `✅ *Old Only Extraction Complete!*\n\n` +
-            `📊 Old records: *${result.oldCount}*\n` +
-            `📊 New records: *${result.newCount}*\n\n` +
-            `🔶 Records in Old but NOT in New: *${result.oldOnlyCount}*\n\n` +
-            `Sending your output file…`, { parse_mode: "Markdown" });
-        await bot.sendDocument(chatId, result.outputPath, {
-            caption: `Old Only output — ${new Date().toLocaleDateString("en-IN")}`,
-        });
-        try {
-            fs.unlinkSync(result.outputPath);
-        }
-        catch { }
-        cleanupSession(chatId);
-    }
-    catch (err) {
-        s.processing = false;
-        bot.sendMessage(chatId, `❌ *Old Only extraction failed:* ${err.message}\n\nCheck your files and use /reset to try again.`, { parse_mode: "Markdown" });
     }
 }
 console.log("🤖 Verification bot is running…");
