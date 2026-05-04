@@ -142,7 +142,8 @@ bot.onText(/\/help/, (msg) => {
         `*Matching logic:*\n` +
         `• XM → \`MT4/MT5 ID\` and \`Client ID\` columns\n` +
         `• Xilion → \`Wallet\` column (e.g. #316393)\n` +
-        `• Duplicates / Old Only → Matches on \`Email\` OR \`Phone\` (either field is enough)`, { parse_mode: "Markdown" });
+        `• Duplicates → Matches on \`Email\` OR \`Phone\` (either field is enough)\n` +
+        `• Old Only → Matches on \`Phone\` only`, { parse_mode: "Markdown" });
 });
 bot.onText(/\/reset/, (msg) => {
     cleanupSession(msg.chat.id);
@@ -201,7 +202,7 @@ bot.onText(/\/oldonly/, (msg) => {
         `⬜ \`old.csv\` — Old records\n` +
         `⬜ \`new.csv\` — New records\n\n` +
         `⚠️ Files must be named exactly as shown above.\n\n` +
-        `📋 Matches on: *Email* OR *Phone* (either field is enough)`, { parse_mode: "Markdown" });
+        `📋 Matches on: *Phone Number* only`, { parse_mode: "Markdown" });
 });
 // ── Document handler ──────────────────────────────────────────────────────────
 bot.on("document", async (msg) => {

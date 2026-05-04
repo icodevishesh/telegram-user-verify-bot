@@ -135,22 +135,18 @@ function getPhone(row) {
         row["Contact"] ||
         "");
 }
-// ── Shared: build email+phone sets from New rows ──────────────────────────────
-function buildNewMatchSets(newRows) {
-    const newByEmail = new Set();
+// ── Shared: build phone set from New rows (phone only matching) ──────────────
+function buildNewPhoneSet(newRows) {
     const newByPhone = new Set();
     for (const row of newRows) {
-        const email = getEmail(row);
         const phone = getPhone(row);
-        if (email)
-            newByEmail.add(email);
         if (phone)
             newByPhone.add(phone);
     }
-    return { newByEmail, newByPhone };
+    return newByPhone;
 }
 // ── Old Only export ───────────────────────────────────────────────────────────
-// Returns only rows from Old that have NO match (by email OR phone) in New.
+// Returns only rows from Old that have NO phone match in New.
 // Output sheet contains all original Old fields — no extra columns added.
 async function processOldOnly(opts) {
     const { oldPath, newPath } = opts;
@@ -160,15 +156,13 @@ async function processOldOnly(opts) {
         throw new Error("old.csv appears to be empty or has no data rows.");
     if (newRows.length === 0)
         throw new Error("new.csv appears to be empty or has no data rows.");
-    // Build lookup sets from New
-    const { newByEmail, newByPhone } = buildNewMatchSets(newRows);
-    // Keep only Old rows that have NO match in New
+    // Build phone lookup set from New (phone only)
+    const newByPhone = buildNewPhoneSet(newRows);
+    // Keep only Old rows that have NO phone match in New
     const oldOnlyRows = [];
     for (const row of oldRows) {
-        const email = getEmail(row);
         const phone = getPhone(row);
-        const isInNew = (email && newByEmail.has(email)) ||
-            (phone && newByPhone.has(phone));
+        const isInNew = phone && newByPhone.has(phone);
         if (!isInNew) {
             oldOnlyRows.push({ ...row });
         }
