@@ -125,6 +125,23 @@ export interface OldOnlyResult {
   oldOnlyCount: number;
 }
 
+export interface StaticReportResult {
+  outputPath: string;
+  verifiedCount: number;
+  sourceCount: number;
+  matchedCount: number;
+}
+
+export interface NonDepositedReportOptions {
+  masterPath?: string;
+  nonDepositedPath?: string;
+}
+
+export interface InactiveUsersReportOptions {
+  masterPath?: string;
+  inactivePath?: string;
+}
+
 // ── Normalize values for comparison ───────────────────────────────────────────
 function normalizeForCompare(val: unknown): string {
   if (val === null || val === undefined) return "";
@@ -133,6 +150,57 @@ function normalizeForCompare(val: unknown): string {
     .toLowerCase()
     .replace(/\s+/g, " ")
     .replace(/^\+/, "");
+}
+
+function normalizeName(val: unknown): string {
+  if (val === null || val === undefined) return "";
+  return String(val).trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function normalizePhone(val: unknown): string {
+  if (val === null || val === undefined) return "";
+  const digits = String(val).replace(/\D/g, "");
+  if (digits.length > 10 && digits.startsWith("91")) return digits.slice(-10);
+  return digits;
+}
+
+function autoSizeColumns(ws: XLSX.WorkSheet, rows: Record<string, unknown>[], fallbackKeys: string[]) {
+  const keys = Object.keys(rows[0] ?? {}).length > 0 ? Object.keys(rows[0]) : fallbackKeys;
+  ws["!cols"] = keys.map((k) => ({
+    wch: Math.max(k.length, ...rows.map((r) => String(r[k] ?? "").length)),
+  }));
+}
+
+function writeRowsToWorkbook(rows: Record<string, unknown>[], sheetName: string, filePrefix: string, fallbackKeys: string[]): string {
+  const outputDir = path.join(__dirname, "outputs");
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const outputPath = path.join(outputDir, `${filePrefix}_${ts}.xlsx`);
+
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.json_to_sheet(rows, { header: fallbackKeys });
+  autoSizeColumns(ws, rows, fallbackKeys);
+  XLSX.utils.book_append_sheet(wb, ws, sheetName);
+  XLSX.writeFile(wb, outputPath);
+
+  return outputPath;
+}
+
+function getVerifiedMasterRows(masterRows: Record<string, string>[]): Record<string, string>[] {
+  return masterRows.filter((row) => row["Verification"] === "Yes");
+}
+
+function resolveBundledFile(fileName: string): string {
+  const candidates = [
+    path.join(process.cwd(), "files", fileName),
+    path.join(__dirname, "files", fileName),
+    path.join(__dirname, "..", "files", fileName),
+  ];
+
+  const found = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!found) throw new Error(`Could not find ${fileName} in the files directory.`);
+  return found;
 }
 
 // ── Column-agnostic field extractors ─────────────────────────────────────────
@@ -222,6 +290,123 @@ export async function processOldOnly(opts: OldOnlyOptions): Promise<OldOnlyResul
     oldCount: oldRows.length,
     newCount: newRows.length,
     oldOnlyCount: oldOnlyRows.length,
+  };
+}
+
+// ── Static reports from bundled workbook files ────────────────────────────────
+export async function processNonDepositedReport(opts: NonDepositedReportOptions = {}): Promise<StaticReportResult> {
+  const masterPath = opts.masterPath ?? resolveBundledFile("MTF Indicator Access (Responses).xlsx");
+  const nonDepositedPath = opts.nonDepositedPath ?? resolveBundledFile("NON DEPOSITED LIST.xlsx");
+
+  const masterRows = readStandardSheet(masterPath);
+  const nonDepositedRows = readStandardSheet(nonDepositedPath);
+
+  if (masterRows.length === 0) throw new Error("Master sheet appears to be empty or has no data rows.");
+  if (nonDepositedRows.length === 0) throw new Error("Non-deposited sheet appears to be empty or has no data rows.");
+
+  const verifiedRows = getVerifiedMasterRows(masterRows);
+  const nonDepositedKeys = new Map<string, Record<string, string>>();
+
+  for (const row of nonDepositedRows) {
+    const phone = normalizePhone(row["Phone"]);
+    const fullName = normalizeName(`${row["Firstname"] ?? ""} ${row["Lastname"] ?? ""}`);
+    if (phone && fullName) nonDepositedKeys.set(`${phone}|${fullName}`, row);
+  }
+
+  const matchedRows: Record<string, unknown>[] = [];
+
+  for (const row of verifiedRows) {
+    const phone = normalizePhone(row["Phone Number"]);
+    const name = normalizeName(row["Name"]);
+    const match = nonDepositedKeys.get(`${phone}|${name}`);
+
+    if (match) {
+      matchedRows.push({
+        Name: row["Name"],
+        "Phone Number": row["Phone Number"],
+        Verification: row["Verification"],
+        "Matched Firstname": match["Firstname"],
+        "Matched Lastname": match["Lastname"],
+        "Matched Phone": match["Phone"],
+        Email: match["Email"],
+        Login: match["Login"],
+        Agent: match["Agent"],
+      });
+    }
+  }
+
+  const fallbackKeys = [
+    "Name",
+    "Phone Number",
+    "Verification",
+    "Matched Firstname",
+    "Matched Lastname",
+    "Matched Phone",
+    "Email",
+    "Login",
+    "Agent",
+  ];
+
+  return {
+    outputPath: writeRowsToWorkbook(matchedRows, "Non Deposited", "non_deposited_verified", fallbackKeys),
+    verifiedCount: verifiedRows.length,
+    sourceCount: nonDepositedRows.length,
+    matchedCount: matchedRows.length,
+  };
+}
+
+export async function processInactiveUsersReport(opts: InactiveUsersReportOptions = {}): Promise<StaticReportResult> {
+  const masterPath = opts.masterPath ?? resolveBundledFile("MTF Indicator Access (Responses).xlsx");
+  const inactivePath = opts.inactivePath ?? resolveBundledFile("DP BUT INACTIVE.xlsx");
+
+  const masterRows = readStandardSheet(masterPath);
+  const inactiveRows = readStandardSheet(inactivePath);
+
+  if (masterRows.length === 0) throw new Error("Master sheet appears to be empty or has no data rows.");
+  if (inactiveRows.length === 0) throw new Error("Inactive sheet appears to be empty or has no data rows.");
+
+  const verifiedRows = getVerifiedMasterRows(masterRows);
+  const inactiveKeys = new Map<string, Record<string, string>>();
+
+  for (const row of inactiveRows) {
+    const phone = normalizePhone(row["Phone number"]);
+    const name = normalizeName(row["Customer"]);
+    if (phone && name) inactiveKeys.set(`${phone}|${name}`, row);
+  }
+
+  const matchedRows: Record<string, unknown>[] = [];
+
+  for (const row of verifiedRows) {
+    const phone = normalizePhone(row["Phone Number"]);
+    const name = normalizeName(row["Name"]);
+    const match = inactiveKeys.get(`${phone}|${name}`);
+
+    if (match) {
+      matchedRows.push({
+        Name: row["Name"],
+        "Phone Number": row["Phone Number"],
+        Verification: row["Verification"],
+        "Matched Customer": match["Customer"],
+        "Matched Phone": match["Phone number"],
+        Login: match["Login"],
+      });
+    }
+  }
+
+  const fallbackKeys = [
+    "Name",
+    "Phone Number",
+    "Verification",
+    "Matched Customer",
+    "Matched Phone",
+    "Login",
+  ];
+
+  return {
+    outputPath: writeRowsToWorkbook(matchedRows, "Inactive Users", "inactive_verified_users", fallbackKeys),
+    verifiedCount: verifiedRows.length,
+    sourceCount: inactiveRows.length,
+    matchedCount: matchedRows.length,
   };
 }
 

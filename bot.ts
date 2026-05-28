@@ -2,7 +2,13 @@ import "dotenv/config";
 import TelegramBot from "node-telegram-bot-api";
 import * as fs from "fs";
 import * as path from "path";
-import { processVerification, processDuplicates, processOldOnly } from "./verifier";
+import {
+  processVerification,
+  processDuplicates,
+  processOldOnly,
+  processNonDepositedReport,
+  processInactiveUsersReport,
+} from "./verifier";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN!;
 if (!TOKEN) {
@@ -18,7 +24,7 @@ interface UploadedFile {
   savedPath: string;
 }
 
-type SessionType = "verify" | "duplicates" | "oldonly";
+type SessionType = "verify" | "duplicates" | "oldonly" | "nodeposited" | "inactiveusers";
 
 interface Session {
   type: SessionType;
@@ -27,6 +33,9 @@ interface Session {
   mtf?: UploadedFile;
   old?: UploadedFile;
   new?: UploadedFile;
+  master?: UploadedFile;
+  nonDeposited?: UploadedFile;
+  inactive?: UploadedFile;
   processing: boolean;
 }
 
@@ -38,6 +47,12 @@ type VerifyName = (typeof VERIFY_NAMES)[number];
 
 const DUPLICATE_NAMES = ["old", "new"] as const;
 type DuplicateName = (typeof DUPLICATE_NAMES)[number];
+
+const NON_DEPOSITED_NAMES = ["master", "nonDeposited"] as const;
+type NonDepositedName = (typeof NON_DEPOSITED_NAMES)[number];
+
+const INACTIVE_USERS_NAMES = ["master", "inactive"] as const;
+type InactiveUsersName = (typeof INACTIVE_USERS_NAMES)[number];
 
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -52,6 +67,20 @@ function resolveVerifySlot(fileName: string): VerifyName | null {
 function resolveDuplicateSlot(fileName: string): DuplicateName | null {
   const base = path.basename(fileName, path.extname(fileName)).toLowerCase().trim();
   if (DUPLICATE_NAMES.includes(base as DuplicateName)) return base as DuplicateName;
+  return null;
+}
+
+function resolveNonDepositedSlot(fileName: string): NonDepositedName | null {
+  const base = path.basename(fileName, path.extname(fileName)).toLowerCase().trim();
+  if (base === "mtf indicator access (responses)") return "master";
+  if (base === "non deposited list") return "nonDeposited";
+  return null;
+}
+
+function resolveInactiveUsersSlot(fileName: string): InactiveUsersName | null {
+  const base = path.basename(fileName, path.extname(fileName)).toLowerCase().trim();
+  if (base === "mtf indicator access (responses)") return "master";
+  if (base === "dp but inactive") return "inactive";
   return null;
 }
 
@@ -70,6 +99,20 @@ function duplicateSessionSummary(s: Session): string {
   ].join("\n");
 }
 
+function nonDepositedSessionSummary(s: Session): string {
+  return [
+    s.master ? `✅ MTF Indicator Access (Responses).xlsx` : `⬜ MTF Indicator Access (Responses).xlsx`,
+    s.nonDeposited ? `✅ NON DEPOSITED LIST.xlsx` : `⬜ NON DEPOSITED LIST.xlsx`,
+  ].join("\n");
+}
+
+function inactiveUsersSessionSummary(s: Session): string {
+  return [
+    s.master ? `✅ MTF Indicator Access (Responses).xlsx` : `⬜ MTF Indicator Access (Responses).xlsx`,
+    s.inactive ? `✅ DP BUT INACTIVE.xlsx` : `⬜ DP BUT INACTIVE.xlsx`,
+  ].join("\n");
+}
+
 function isVerifyComplete(s: Session): boolean {
   return !!(s.xm && s.xilion && s.mtf);
 }
@@ -78,10 +121,25 @@ function isDuplicateComplete(s: Session): boolean {
   return !!(s.old && s.new);
 }
 
+function isNonDepositedComplete(s: Session): boolean {
+  return !!(s.master && s.nonDeposited);
+}
+
+function isInactiveUsersComplete(s: Session): boolean {
+  return !!(s.master && s.inactive);
+}
+
 function cleanupSession(chatId: number) {
   const s = sessions[chatId];
   if (!s) return;
-  const keys = s.type === "verify" ? VERIFY_NAMES : DUPLICATE_NAMES;
+  const keys =
+    s.type === "verify"
+      ? VERIFY_NAMES
+      : s.type === "nodeposited"
+        ? NON_DEPOSITED_NAMES
+        : s.type === "inactiveusers"
+          ? INACTIVE_USERS_NAMES
+        : DUPLICATE_NAMES;
   for (const key of keys) {
     const f = s[key as keyof Session] as UploadedFile | undefined;
     if (f?.savedPath && fs.existsSync(f.savedPath)) {
@@ -101,6 +159,9 @@ bot.onText(/\/start/, (msg) => {
     `/verify — Start a new verification session\n` +
     `/duplicates — Compare old & new CSV sheets for duplicates\n` +
     `/oldonly — Extract records present in Old but not in New\n` +
+    `/nodeposited — Upload master + non-deposited files and list verified users\n` +
+    `/nondeposited — Alias for /nodeposited\n` +
+    `/inactiveusers — Upload master + inactive files and list verified users\n` +
     `/status — Check which files have been uploaded\n` +
     `/reset  — Clear the current session\n` +
     `/help   — Show usage instructions`,
@@ -134,26 +195,40 @@ bot.onText(/\/help/, (msg) => {
     `   • \`new.csv\` — New records\n` +
     `3️⃣ Processing starts automatically\n` +
     `4️⃣ Bot sends back an XLSX with *only* records from Old that are NOT in New\n\n` +
+    `*Non Deposited:*\n` +
+    `1️⃣ Send /nodeposited\n` +
+    `2️⃣ Upload *2 files* (in any order):\n` +
+    `   • \`MTF Indicator Access (Responses).xlsx\`\n` +
+    `   • \`NON DEPOSITED LIST.xlsx\`\n` +
+    `3️⃣ Bot sends back an XLSX with verified users found in the non-deposited sheet\n\n` +
+    `*Inactive Users:*\n` +
+    `1️⃣ Send /inactiveusers\n` +
+    `2️⃣ Upload *2 files* (in any order):\n` +
+    `   • \`MTF Indicator Access (Responses).xlsx\`\n` +
+    `   • \`DP BUT INACTIVE.xlsx\`\n` +
+    `3️⃣ Bot sends back an XLSX with verified users found in the inactive sheet\n\n` +
     `⚠️ Files must be named *exactly* as shown above\n\n` +
     `*Matching logic:*\n` +
     `• XM → \`MT4/MT5 ID\` and \`Client ID\` columns\n` +
     `• Xilion → \`Wallet\` column (e.g. #316393)\n` +
     `• Duplicates → Matches on \`Email\` OR \`Phone\` (either field is enough)\n` +
-    `• Old Only → Matches on \`Phone\` only`,
+    `• Old Only → Matches on \`Phone\` only\n` +
+    `• Non Deposited → Verified users matched by \`Phone Number\` + \`Name\`\n` +
+    `• Inactive Users → Verified users matched by \`Phone Number\` + \`Name\``,
     { parse_mode: "Markdown" }
   );
 });
 
 bot.onText(/\/reset/, (msg) => {
   cleanupSession(msg.chat.id);
-  bot.sendMessage(msg.chat.id, "🔄 Session cleared. Send /verify, /duplicates, or /oldonly to start again.");
+  bot.sendMessage(msg.chat.id, "🔄 Session cleared. Send /verify, /duplicates, /oldonly, /nodeposited, or /inactiveusers to start again.");
 });
 
 bot.onText(/\/status/, (msg) => {
   const chatId = msg.chat.id;
   const s = sessions[chatId];
   if (!s) {
-    bot.sendMessage(chatId, "No active session. Send /verify, /duplicates, or /oldonly to begin.");
+    bot.sendMessage(chatId, "No active session. Send /verify, /duplicates, /oldonly, /nodeposited, or /inactiveusers to begin.");
     return;
   }
 
@@ -164,6 +239,24 @@ bot.onText(/\/status/, (msg) => {
     bot.sendMessage(
       chatId,
       `*Upload Status:*\n\n${verifySessionSummary(s)}\n\n${extra}`,
+      { parse_mode: "Markdown" }
+    );
+  } else if (s.type === "nodeposited") {
+    const extra = s.processing
+      ? `⚙️ Non-deposited report is currently running…`
+      : isNonDepositedComplete(s) ? `✅ All files received.` : `Upload the remaining files to continue.`;
+    bot.sendMessage(
+      chatId,
+      `*Upload Status:*\n\n${nonDepositedSessionSummary(s)}\n\n${extra}`,
+      { parse_mode: "Markdown" }
+    );
+  } else if (s.type === "inactiveusers") {
+    const extra = s.processing
+      ? `⚙️ Inactive users report is currently running…`
+      : isInactiveUsersComplete(s) ? `✅ All files received.` : `Upload the remaining files to continue.`;
+    bot.sendMessage(
+      chatId,
+      `*Upload Status:*\n\n${inactiveUsersSessionSummary(s)}\n\n${extra}`,
       { parse_mode: "Markdown" }
     );
   } else {
@@ -228,13 +321,43 @@ bot.onText(/\/oldonly/, (msg) => {
   );
 });
 
+bot.onText(/\/(?:nodeposited|nondeposited)/, (msg) => {
+  const chatId = msg.chat.id;
+  cleanupSession(chatId);
+  sessions[chatId] = { type: "nodeposited", processing: false };
+  bot.sendMessage(
+    chatId,
+    `✅ *Non-Deposited report session started!*\n\n` +
+    `Upload these *2 files* in any order:\n\n` +
+    `⬜ \`MTF Indicator Access (Responses).xlsx\`\n` +
+    `⬜ \`NON DEPOSITED LIST.xlsx\`\n\n` +
+    `⚠️ Files must be named exactly as shown above.`,
+    { parse_mode: "Markdown" }
+  );
+});
+
+bot.onText(/\/inactiveusers/, (msg) => {
+  const chatId = msg.chat.id;
+  cleanupSession(chatId);
+  sessions[chatId] = { type: "inactiveusers", processing: false };
+  bot.sendMessage(
+    chatId,
+    `✅ *Inactive Users report session started!*\n\n` +
+    `Upload these *2 files* in any order:\n\n` +
+    `⬜ \`MTF Indicator Access (Responses).xlsx\`\n` +
+    `⬜ \`DP BUT INACTIVE.xlsx\`\n\n` +
+    `⚠️ Files must be named exactly as shown above.`,
+    { parse_mode: "Markdown" }
+  );
+});
+
 // ── Document handler ──────────────────────────────────────────────────────────
 bot.on("document", async (msg) => {
   const chatId = msg.chat.id;
 
   const s = sessions[chatId];
   if (!s) {
-    bot.sendMessage(chatId, "⚠️ No active session. Send /verify, /duplicates, or /oldonly first.");
+    bot.sendMessage(chatId, "⚠️ No active session. Send /verify, /duplicates, /oldonly, /nodeposited, or /inactiveusers first.");
     return;
   }
 
@@ -257,15 +380,24 @@ bot.on("document", async (msg) => {
 
   if (s.type === "verify") {
     slot = resolveVerifySlot(fileName);
+  } else if (s.type === "nodeposited") {
+    slot = resolveNonDepositedSlot(fileName);
+  } else if (s.type === "inactiveusers") {
+    slot = resolveInactiveUsersSlot(fileName);
   } else {
     // duplicates and oldonly both use old + new
     slot = resolveDuplicateSlot(fileName);
   }
 
   if (!slot) {
-    const expectedFiles = s.type === "verify"
-      ? "`xm.csv` · `xilion.csv` · `mtf.csv`"
-      : "`old.csv` · `new.csv`";
+    const expectedFiles =
+      s.type === "verify"
+        ? "`xm.csv` · `xilion.csv` · `mtf.csv`"
+        : s.type === "nodeposited"
+          ? "`MTF Indicator Access (Responses).xlsx` · `NON DEPOSITED LIST.xlsx`"
+          : s.type === "inactiveusers"
+            ? "`MTF Indicator Access (Responses).xlsx` · `DP BUT INACTIVE.xlsx`"
+          : "`old.csv` · `new.csv`";
     bot.sendMessage(
       chatId,
       `❌ *${fileName}* is not a recognised file name.\n\n` +
@@ -296,7 +428,16 @@ bot.on("document", async (msg) => {
     const response = await fetch(fileLink);
     fs.writeFileSync(savedPath, Buffer.from(await response.arrayBuffer()));
 
-    if (slot === "old" || slot === "new" || slot === "xm" || slot === "xilion" || slot === "mtf") {
+    if (
+      slot === "old" ||
+      slot === "new" ||
+      slot === "xm" ||
+      slot === "xilion" ||
+      slot === "mtf" ||
+      slot === "master" ||
+      slot === "nonDeposited" ||
+      slot === "inactive"
+    ) {
       (s as unknown as Record<string, UploadedFile>)[slot] = { originalName: fileName, savedPath };
     }
 
@@ -316,6 +457,46 @@ bot.on("document", async (msg) => {
       if (isVerifyComplete(s) && !s.processing) {
         s.processing = true;
         await runVerification(chatId, s);
+      }
+
+    } else if (s.type === "nodeposited") {
+      const remaining = NON_DEPOSITED_NAMES.filter((k) => !s[k as keyof Session]);
+      const remainingList = remaining
+        .map((r) => r === "master" ? `\`MTF Indicator Access (Responses).xlsx\`` : `\`NON DEPOSITED LIST.xlsx\``)
+        .join(" · ");
+
+      await bot.editMessageText(
+        `✅ *${fileName}* received!\n\n` +
+        `*Progress:*\n${nonDepositedSessionSummary(s)}\n\n` +
+        (remaining.length > 0
+          ? `Still needed: ${remainingList}`
+          : `🚀 All files received! Starting non-deposited report…`),
+        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+      );
+
+      if (isNonDepositedComplete(s) && !s.processing) {
+        s.processing = true;
+        await runNonDeposited(chatId, s);
+      }
+
+    } else if (s.type === "inactiveusers") {
+      const remaining = INACTIVE_USERS_NAMES.filter((k) => !s[k as keyof Session]);
+      const remainingList = remaining
+        .map((r) => r === "master" ? `\`MTF Indicator Access (Responses).xlsx\`` : `\`DP BUT INACTIVE.xlsx\``)
+        .join(" · ");
+
+      await bot.editMessageText(
+        `✅ *${fileName}* received!\n\n` +
+        `*Progress:*\n${inactiveUsersSessionSummary(s)}\n\n` +
+        (remaining.length > 0
+          ? `Still needed: ${remainingList}`
+          : `🚀 All files received! Starting inactive users report…`),
+        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+      );
+
+      if (isInactiveUsersComplete(s) && !s.processing) {
+        s.processing = true;
+        await runInactiveUsers(chatId, s);
       }
 
     } else {
@@ -456,6 +637,75 @@ async function runOldOnly(chatId: number, s: Session) {
       chatId,
       `❌ *Old Only extraction failed:* ${err.message}\n\nCheck your files and use /reset to try again.`,
       { parse_mode: "Markdown" }
+    );
+  }
+}
+
+// ── Static report runners ────────────────────────────────────────────────────
+async function runNonDeposited(chatId: number, s: Session) {
+  const statusMsg = await bot.sendMessage(chatId, "⏳ Building non-deposited verified users report…");
+
+  try {
+    const result = await processNonDepositedReport({
+      masterPath: s.master!.savedPath,
+      nonDepositedPath: s.nonDeposited!.savedPath,
+    });
+
+    await bot.editMessageText(
+      `✅ *Non-Deposited Report Complete!*\n\n` +
+      `📊 Verified users: *${result.verifiedCount}*\n` +
+      `📊 Non-deposited records: *${result.sourceCount}*\n` +
+      `✅ Matches found: *${result.matchedCount}*\n\n` +
+      `Sending your output file…`,
+      { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+    );
+
+    await bot.sendDocument(chatId, result.outputPath, {
+      caption: `Non-deposited verified users — ${new Date().toLocaleDateString("en-IN")}`,
+    });
+
+    try { fs.unlinkSync(result.outputPath); } catch {}
+    cleanupSession(chatId);
+
+  } catch (err: any) {
+    s.processing = false;
+    await bot.editMessageText(
+      `❌ *Non-deposited report failed:* ${err.message}`,
+      { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+    );
+  }
+}
+
+async function runInactiveUsers(chatId: number, s: Session) {
+  const statusMsg = await bot.sendMessage(chatId, "⏳ Building inactive verified users report…");
+
+  try {
+    const result = await processInactiveUsersReport({
+      masterPath: s.master!.savedPath,
+      inactivePath: s.inactive!.savedPath,
+    });
+
+    await bot.editMessageText(
+      `✅ *Inactive Users Report Complete!*\n\n` +
+      `📊 Verified users: *${result.verifiedCount}*\n` +
+      `📊 Inactive records: *${result.sourceCount}*\n` +
+      `✅ Matches found: *${result.matchedCount}*\n\n` +
+      `Sending your output file…`,
+      { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
+    );
+
+    await bot.sendDocument(chatId, result.outputPath, {
+      caption: `Inactive verified users — ${new Date().toLocaleDateString("en-IN")}`,
+    });
+
+    try { fs.unlinkSync(result.outputPath); } catch {}
+    cleanupSession(chatId);
+
+  } catch (err: any) {
+    s.processing = false;
+    await bot.editMessageText(
+      `❌ *Inactive users report failed:* ${err.message}`,
+      { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: "Markdown" }
     );
   }
 }
